@@ -209,3 +209,6 @@ __marimo__/
 
 # Service Account Credentials
 service-account.json
+
+# Add my own files 
+/tests
