@@ -1,18 +1,21 @@
 """
 Import File Router
-Endpoint để xử lý 3 file đầu vào (chấm công, thông tin lương, template) và tạo file lương kết quả
+Endpoint để xử lý 2 file đầu vào (attendance + salary info) và tạo file lương kết quả với AI Agent
 """
 import os
 import uuid
 import logging
 import math
+import json
 from fastapi import APIRouter, BackgroundTasks, File, UploadFile, HTTPException, Form
 from fastapi.responses import FileResponse
 from template.agent.agent import Agent
-from template.schemas.model import ChatRequestAPI
+from template.schemas.model import ChatRequest
 from template.services.aws_service import S3Service
-from template.services.read_excel_xlsx import read_excel_to_array, matching_data
-from template.services.portgre_services import insert_employee_data, create_table
+from template.services.read_excel_xlsx import (
+    read_excel_complete,
+    get_sheet_names
+)
 
 
 logger = logging.getLogger(__name__)
@@ -20,12 +23,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["Import File"])
 
 # Initialize agent and S3 service
-import_agent = Agent()
+salary_processing_agent = Agent()  # Uses SALARY_AGENT_SYSTEM_PROMPT by default
 s3_service = S3Service()
 
 
 def sanitize_for_json(obj):
-    """Recursively sanitize data to be JSON-compliant by replacing NaN, Infinity with None"""
+    """Làm sạch dữ liệu để tương thích JSON bằng cách thay thế NaN, Infinity bằng None"""
     if isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -44,19 +47,17 @@ async def import_file(
     user_id: int = Form(..., description="ID người dùng"),
     background_tasks: BackgroundTasks = None,
     attendance_file: UploadFile = File(..., description="File chấm công của nhân viên (.xlsx)"),
-    salary_info_file: UploadFile = File(..., description="File thông tin lương cơ bản (.xlsx)"),
     template_file: UploadFile = File(..., description="File template tính lương (.xlsx)"),
     
 ):
     """
-    Import và xử lý 3 file để tạo file lương kết quả
+    Import và xử lý 2 file để tạo file lương kết quả
     
     ## Mô tả
-    Endpoint này nhận 3 file đầu vào:
+    Endpoint này nhận 2 file đầu vào:
     - **session_id**: ID phiên làm việc
     - **user_id**: ID người dùng
     - **attendance_file**: File chứa thông tin chấm công của các nhân viên
-    - **salary_info_file**: File chứa thông tin lương cơ bản (mỗi nhân viên có mức lương khác nhau)
     - **template_file**: File template dùng để tính lương (có công thức tính toán)
     
     ## Agent sẽ:
@@ -78,7 +79,6 @@ async def import_file(
       -F "session_id=your_session_id" \\
       -F "user_id=your_user_id" \\
       -F "attendance_file=@cham_cong.xlsx" \\
-      -F "salary_info_file=@thong_tin_luong.xlsx" \\
       -F "template_file=@template_tinh_luong.xlsx"
     ```
     """
@@ -87,178 +87,158 @@ async def import_file(
     
     # Initialize path variables
     attendance_path = None
-    salary_info_path = None
     template_path = None
     
     try:
-        # Validate file extensions
-        for file in [attendance_file, salary_info_file, template_file]:
+        # Kiểm tra định dạng file
+        for file in [attendance_file, template_file]:
             if not file.filename.endswith(('.xlsx', '.xls')):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File {file.filename} must be Excel format (.xlsx or .xls)"
+                    detail=f"File {file.filename} phải có định dạng Excel (.xlsx hoặc .xls)"
                 )
         
-        # Save uploaded files
-        logger.info(f"Processing files for request {unique_id}")
-        create_table()
+        # Lưu các file được upload
+        logger.info(f"Đang xử lý các file cho yêu cầu {unique_id}")
+        
+        # Tạo bảng với logic retry
+        try:
+            create_table()
+            logger.info("✓ Đã tạo/xác minh bảng cơ sở dữ liệu")
+        except Exception as e:
+            logger.error(f"Kết nối cơ sở dữ liệu thất bại: {str(e)}")
+            # Tiếp tục không có database - các file vẫn sẽ được xử lý
+            logger.warning("⚠️ Tiếp tục mà không có kết nối cơ sở dữ liệu")
 
         attendance_path = f"uploads/attendance_{unique_id}.xlsx"
-        salary_info_path = f"uploads/salary_info_{unique_id}.xlsx"
         template_path = f"uploads/template_{unique_id}.xlsx"
         output_path = f"outputs/result_{unique_id}.xlsx"
         
-        logger.info("Saving uploaded files...")
+        logger.info("Đang lưu các file đã tải lên...")
         with open(attendance_path, "wb") as f:
             f.write(await attendance_file.read())
-        logger.info(f"✓ Saved attendance file: {attendance_file.filename}")
-        
-        with open(salary_info_path, "wb") as f:
-            f.write(await salary_info_file.read())
-        logger.info(f"✓ Saved salary info file: {salary_info_file.filename}")
-        
+        logger.info(f"✓ Đã lưu file chấm công: {attendance_file.filename}")
+
         with open(template_path, "wb") as f:
             f.write(await template_file.read())
-        logger.info(f"✓ Saved template file: {template_file.filename}")
+        logger.info(f"✓ Đã lưu file template: {template_file.filename}")
         
-        # Upload input files to S3
+        # Tải các file đầu vào lên S3
         try:
             s3_attendance_key = s3_service.upload_file(
                 attendance_path, "inputs", f"attendance_{unique_id}.xlsx"
             )
-            s3_salary_key = s3_service.upload_file(
-                salary_info_path, "inputs", f"salary_info_{unique_id}.xlsx"
-            )
             s3_template_key = s3_service.upload_file(
                 template_path, "inputs", f"template_{unique_id}.xlsx"
             )
-            logger.info(f"✓ Uploaded input files to S3")
+            logger.info(f"✓ Đã tải các file đầu vào lên S3")
         except Exception as e:
-            logger.warning(f"Could not upload to S3: {str(e)}")
+            logger.warning(f"Không thể tải lên S3: {str(e)}")
 
-        # Read attendance data and insert into database
-        logger.info("Reading Excel files...")
+        # Đọc dữ liệu chấm công và chèn vào cơ sở dữ liệu
+        logger.info("Đang đọc các file Excel...")
         attendance_data = read_excel_to_array(attendance_path)
-        salary_data = read_excel_to_array(salary_info_path)
-
-        logger.info("Matching attendance and salary data...")
-        combined_data = matching_data(attendance_data, salary_data)
         
-        logger.info(f"Inserting {len(combined_data)} employees into database...")
-        inserted_count = insert_employee_data(combined_data)
-        logger.info(f"✓ Successfully inserted {inserted_count} employees")
-        
-        return {
-            "success": True,
-            "data": inserted_count
-        }
-        
-        # # Process files using agent
-        # logger.info("Starting agent analysis and processing...")
-        # result = import_agent.analyze_and_process(
-        #     attendance_file=attendance_path,
-        #     salary_info_file=salary_info_path,
-        #     template_file=template_path,
-        #     output_file=output_path
-        # )
-        
-        # # Check if output file was created
-        # if not os.path.exists(output_path):
-        #     raise HTTPException(
-        #         status_code=500,
-        #         detail="Failed to generate output file"
-        #     )
-        
-        # # Upload output file to S3
-        # try:
-        #     s3_output_key = s3_service.upload_file(
-        #         output_path, "outputs", f"result_{unique_id}.xlsx"
-        #     )
-        #     logger.info(f"✓ Uploaded output file to S3: {s3_output_key}")
-        #     s3_download_url = s3_service.generate_presigned_url(s3_output_key)
-        # except Exception as e:
-        #     logger.warning(f"Could not upload output to S3: {str(e)}")
-        #     s3_download_url = None
-        
-        # # Clean up uploaded input files
-        # try:
-        #     for path in [attendance_path, salary_info_path, template_path]:
-        #         if os.path.exists(path):
-        #             os.remove(path)
-        #     logger.info("✓ Cleaned up uploaded files")
-        # except Exception as e:
-        #     logger.warning(f"Could not clean up files: {str(e)}")
-        
-        # # Prepare response
-        # response_data = {
-        #     "success": True,
-        #     "message": "Files processed successfully",
-        #     "unique_id": unique_id,
-        #     "output_file": os.path.basename(output_path),
-        #     "download_link": f"/download/{os.path.basename(output_path)}",
-        #     "s3_download_url": s3_download_url,
-        #     "analysis": {
-        #         "template_info": result.get("template_info", {}),
-        #         "employee_summary": result.get("employee_summary", {}),
-        #         "processing_result": result.get("processing_result", {})
-        #     },
-        #     "employee_details": result.get("employee_details", [])
-        # }
-        
-        # # Add validation results if available
-        # validation_result = result.get("validation_result")
-        # if validation_result:
-        #     response_data["validation"] = {
-        #         "success": validation_result.get("success", False),
-        #         "total_errors": validation_result.get("summary", {}).get("total_errors", 0),
-        #         "total_warnings": validation_result.get("summary", {}).get("total_warnings", 0),
-        #         "errors": validation_result.get("errors", []),
-        #         "warnings": validation_result.get("warnings", [])[:10]  # Limit to 10 warnings in API response
-        #     }
+        # Bỏ qua dòng đầu tiên nếu chứa header (phát hiện bằng cách kiểm tra giá trị có phải tên cột)
+        if combined_data and len(combined_data) > 0:
+            first_row = combined_data[0]
+            # Kiểm tra nếu dòng đầu tiên chứa dữ liệu giống header (các giá trị khớp với tên cột tiếng Việt phổ biến)
+            header_indicators = ['Mã nhân viên', 'Tên nhân viên', 'Họ và tên', 'Ngày']
+            is_header_row = any(str(value) in header_indicators for value in first_row.values())
             
-        #     # Add validation errors to warnings
-        #     if validation_result.get("errors"):
-        #         if "warnings" not in response_data:
-        #             response_data["warnings"] = []
-        #         response_data["warnings"].extend([
-        #             f"⚠️ Validation error: {err['message']}" 
-        #             for err in validation_result["errors"][:3]
-        #         ])
+            if is_header_row:
+                logger.info(f"Đã phát hiện dòng header trong dữ liệu, bỏ qua bản ghi đầu tiên")
+                combined_data = combined_data[1:]  # Bỏ qua dòng header
         
-        # # Separate complete and incomplete employees
-        # complete_employees = [emp for emp in result.get("employee_details", []) if emp["is_complete"]]
-        # incomplete_employees = [emp for emp in result.get("employee_details", []) if not emp["is_complete"]]
+        # Debug: Ghi log các key mẫu của nhân viên
+        if combined_data:
+            sample_keys = list(combined_data[0].keys())
+            logger.info(f"Tổng số bản ghi đã ghép: {len(combined_data)}")
+            logger.info(f"Các key mẫu của nhân viên (10 đầu tiên): {sample_keys[:10]}")
+            logger.info(f"Tất cả các key: {sample_keys}")
         
-        # # Add summary messages
-        # if incomplete_employees:
-        #     response_data["warnings"] = [
-        #         f"⚠️ {len(incomplete_employees)} nhân viên thiếu thông tin và không được tính lương"
-        #     ]
-        #     response_data["incomplete_employees"] = [
-        #         {
-        #             "employee_id": emp["employee_id"],
-        #             "employee_name": emp["employee_name"],
-        #             "missing_fields": emp["missing_fields"]
-        #         }
-        #         for emp in incomplete_employees
-        #     ]
+        # Chuyển đổi dữ liệu để khớp với schema cơ sở dữ liệu
+        logger.info("Đang chuyển đổi dữ liệu để chèn vào cơ sở dữ liệu...")
+        transformed_data = []
+        for idx, employee in enumerate(combined_data):
+            # Ghi log nhân viên đầu tiên để debug
+            if idx == 0:
+                logger.info(f"Mẫu dữ liệu nhân viên đầu tiên: {employee}")
+            
+            # Trích xuất và ánh xạ các trường vào schema cơ sở dữ liệu
+            # Dựa trên cấu trúc Excel thực tế: attendance_col_3 = Mã nhân viên, attendance_col_4 = Tên nhân viên, v.v.
+            transformed = {
+                'Mã nhân viên': employee.get('attendance_col_3') or employee.get('attendance_Mã nhân viên') or employee.get('salary_Mã NV'),
+                'Họ và tên': employee.get('attendance_col_4') or employee.get('attendance_Tên nhân viên') or employee.get('salary_Họ và tên'),
+                'Số ngày công thực tế': employee.get('attendance_col_14') or employee.get('attendance_Tổng số công') or 0,
+                'Số giờ làm thêm': employee.get('attendance_col_13') or employee.get('attendance_Tổng thời gian tính công (giờ)') or 0,
+                'Số ngày nghỉ phép': employee.get('attendance_Số ngày nghỉ phép') or 0,
+                'Số ngày nghỉ không lương': employee.get('attendance_Số ngày nghỉ không lương') or 0,
+                'Số lần đi muộn': employee.get('attendance_Số lần đi muộn') or 0,
+                'Số lần về sớm': employee.get('attendance_Số lần về sớm') or 0,
+                'Dự án': employee.get('salary_Dự án') or '',
+                'Phòng ban': employee.get('salary_Phòng ban') or '',
+                'Hệ số thử việc': employee.get('salary_Hệ số thử việc') or 1.0,
+                'Chức danh': employee.get('salary_Chức danh') or '',
+                'Lương cơ bản': employee.get('salary_Lương cơ bản') or 0,
+                'Lương đóng BHXH': employee.get('salary_Lương đóng BHXH') or 0,
+                'Thưởng cố định': employee.get('salary_Thưởng cố định') or 0,
+                'Phụ cấp chức vụ': employee.get('salary_Phụ cấp chức vụ') or 0,
+                'Phụ cấp xăng xe': employee.get('salary_Phụ cấp xăng xe') or 0,
+                'Phụ cấp điện thoại': employee.get('salary_Phụ cấp điện thoại') or 0,
+                'Phụ cấp cơm': employee.get('salary_Phụ cấp cơm') or 0,
+                'Số người phụ thuộc': employee.get('salary_Số người phụ thuộc') or 0,
+            }
+            
+            # Ghi log bản ghi đã chuyển đổi đầu tiên
+            if idx == 0:
+                logger.info(f"Nhân viên đã chuyển đổi đầu tiên: {transformed}")
+            
+            # Chỉ thêm nếu có ít nhất một mã nhân viên
+            if transformed['Mã nhân viên']:
+                transformed_data.append(transformed)
         
-        # if complete_employees:
-        #     response_data["success_message"] = f"✅ Đã tính lương cho {len(complete_employees)} nhân viên"
+        logger.info(f"Đã chuyển đổi {len(transformed_data)} bản ghi nhân viên")
         
-        # # Sanitize response data to remove NaN/Infinity values before JSON serialization
-        # response_data = sanitize_for_json(response_data)
+        # Chèn vào cơ sở dữ liệu với xử lý lỗi
+        try:
+            logger.info(f"Đang chèn {len(transformed_data)} nhân viên vào cơ sở dữ liệu...")
+            inserted_count = insert_employee_data(transformed_data)
+            logger.info(f"✓ Đã chèn thành công {inserted_count} nhân viên")
+            
+            return {
+                "success": True,
+                "message": "Đã xử lý file và chèn dữ liệu thành công",
+                "unique_id": unique_id,
+                "data": {
+                    "total_employees": len(combined_data),
+                    "transformed_employees": len(transformed_data),
+                    "inserted_count": inserted_count
+                }
+            }
+        except Exception as db_error:
+            logger.error(f"Chèn vào cơ sở dữ liệu thất bại: {str(db_error)}")
+            # Vẫn trả về thành công vì các file đã được xử lý
+            return {
+                "success": True,
+                "message": "Đã xử lý file nhưng chèn vào cơ sở dữ liệu thất bại",
+                "unique_id": unique_id,
+                "warning": str(db_error),
+                "data": {
+                    "total_employees": len(combined_data),
+                    "inserted_count": 0
+                }
+            }
         
-        # logger.info(f"✓ Request {unique_id} completed successfully")
-        # return response_data
+
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing files: {str(e)}", exc_info=True)
+        logger.error(f"Lỗi khi xử lý file: {str(e)}", exc_info=True)
         
-        # Clean up files on error
-        for path in [attendance_path, salary_info_path, template_path]:
+        # Dọn dẹp các file khi có lỗi
+        for path in [attendance_path, template_path]:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -267,7 +247,7 @@ async def import_file(
         
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing files: {str(e)}"
+            detail=f"Lỗi khi xử lý file: {str(e)}"
         )
 
 
@@ -277,7 +257,7 @@ async def download_result(filename: str):
     file_path = f"outputs/{filename}"
     
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="Không tìm thấy file")
     
     return FileResponse(
         path=file_path,

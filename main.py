@@ -6,6 +6,7 @@ import logging
 from template.configs.environments import env
 from template.router.v1.ai import RouterAI
 from template.router.v1.import_file import router as ImportFileRouter
+from template.router.v1.import_file_new import router as ImportFileAIRouter  # New AI-powered endpoint
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -30,6 +31,7 @@ app.add_middleware(
 # Include API routers
 app.include_router(RouterAI)
 app.include_router(ImportFileRouter)
+app.include_router(ImportFileAIRouter)  # New AI-powered router
 
 @app.get("/health")
 async def health_check():

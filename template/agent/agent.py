@@ -14,7 +14,7 @@ from langchain.agents import AgentExecutor
 from template.configs.environments import get_environment_variables
 from template.schemas.model import ChatRequest, ChatResponse
 from template.agent.histories import RedisSupportChatHistory
-from template.agent.prompts import SYSTEM_PROMPT
+from template.agent.prompts import SYSTEM_PROMPT, SALARY_AGENT_SYSTEM_PROMPT
 from template.agent.tools.caculator import add, subtract, multiply, divide, mod
 from template.agent.tools.search import (
     google_search
@@ -133,7 +133,7 @@ class Agent:
     def __init__(self, 
                  api_key: str = None, 
                  model: str = None, 
-                 prompt: str = SYSTEM_PROMPT, 
+                 prompt: str = SALARY_AGENT_SYSTEM_PROMPT,  # Changed to use Salary Agent prompt
                  temperature: float = 0.2,
                  tools: list = default_tools):
         # Initialize LLM with Vertex AI (Gemini)

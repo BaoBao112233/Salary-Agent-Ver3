@@ -6,10 +6,6 @@ import pandas as pd
 import json
 from datetime import datetime, date
 import re
-import logging
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -38,7 +34,7 @@ def read_excel_complete(file_path):
     
     # Duyệt qua tất cả các sheets
     for sheet_name in wb_formula.sheetnames:
-        logger.info(f"\n=== Đang đọc sheet: {sheet_name} ===")
+        print(f"\n=== Đang đọc sheet: {sheet_name} ===")
         
         sheet_formula = wb_formula[sheet_name]
         sheet_values = wb_values[sheet_name]
@@ -386,6 +382,269 @@ def convert_json_file_to_excel(json_file_path, excel_output_path):
         convert_json_file_to_excel("output.json", "restored.xlsx")
     """
     return json_to_excel(json_file_path, excel_output_path)
+
+def display_sheet_info(sheet_data):
+    """
+    Hiển thị thông tin chi tiết của một sheet
+    """
+    print(f"\nSheet: {sheet_data['name']}")
+    print("-" * 80)
+    
+    for row_idx, row in enumerate(sheet_data['data'], start=1):
+        for cell_info in row:
+            if cell_info['formula']:
+                print(f"Ô {cell_info['cell']}: "
+                      f"Công thức = {cell_info['formula']}, "
+                      f"Giá trị = {cell_info['value']}")
+
+
+def convert_json_file_to_excel(json_file_path, excel_output_path):
+    """
+    Hàm tiện ích: Convert trực tiếp từ file JSON sang file Excel
+    
+    Args:
+        json_file_path (str): Đường dẫn đến file JSON input
+        excel_output_path (str): Đường dẫn file Excel output
+    
+    Returns:
+        bool: True nếu thành công
+    
+    Example:
+        convert_json_file_to_excel("output.json", "restored.xlsx")
+    """
+    return json_to_excel(json_file_path, excel_output_path)
+
+
+def read_excel_to_array(file_path, sheet_name=None):
+    """
+    Đọc file Excel và trả về dữ liệu dưới dạng array đơn giản
+    Phù hợp cho việc xử lý dữ liệu thông thường (không cần formula/formatting)
+    
+    Args:
+        file_path (str): Đường dẫn đến file Excel
+        sheet_name (str, optional): Tên sheet cần đọc. Nếu None, đọc sheet đầu tiên
+    
+    Returns:
+        list: Mảng 2 chiều chứa giá trị các ô (chỉ value, không có formula/format)
+        
+    Example:
+        data = read_excel_to_array("file.xlsx", "Sheet1")
+        # data = [
+        #     ["Name", "Age", "Salary"],
+        #     ["John", 25, 50000],
+        #     ["Jane", 30, 60000]
+        # ]
+    """
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    
+    # Lấy sheet
+    if sheet_name:
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            raise ValueError(f"Sheet '{sheet_name}' không tồn tại. Available sheets: {wb.sheetnames}")
+        ws = wb[sheet_name]
+    else:
+        ws = wb.active
+    
+    # Đọc dữ liệu thành array
+    data = []
+    for row in ws.iter_rows(values_only=True):
+        data.append(list(row))
+    
+    wb.close()
+    return data
+
+
+def read_all_sheets_to_dict(file_path):
+    """
+    Đọc tất cả sheets trong file Excel và trả về dictionary
+    
+    Args:
+        file_path (str): Đường dẫn đến file Excel
+    
+    Returns:
+        dict: Dictionary với key là tên sheet, value là array 2 chiều
+        
+    Example:
+        all_data = read_all_sheets_to_dict("file.xlsx")
+        # all_data = {
+        #     "Sheet1": [[...], [...], ...],
+        #     "Sheet2": [[...], [...], ...]
+        # }
+    """
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    
+    all_sheets = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        data = []
+        for row in ws.iter_rows(values_only=True):
+            data.append(list(row))
+        all_sheets[sheet_name] = data
+    
+    wb.close()
+    return all_sheets
+
+
+def matching_data(attendance_data, salary_data, header_row_index=0, data_start_index=1):
+    """
+    Ghép dữ liệu chấm công với dữ liệu lương theo mã nhân viên
+    
+    Args:
+        attendance_data (list): Dữ liệu chấm công (array 2D)
+        salary_data (list): Dữ liệu lương (array 2D)
+        header_row_index (int): Index của dòng header (mặc định 0)
+        data_start_index (int): Index bắt đầu của dữ liệu (mặc định 1)
+    
+    Returns:
+        list: Danh sách dictionary chứa thông tin đầy đủ của mỗi nhân viên
+        
+    Example:
+        attendance = [
+            ["ID", "Name", "Days"],
+            ["E001", "John", 22],
+            ["E002", "Jane", 20]
+        ]
+        salary = [
+            ["ID", "Base Salary"],
+            ["E001", 5000000],
+            ["E002", 6000000]
+        ]
+        result = matching_data(attendance, salary)
+        # result = [
+        #     {"id": "E001", "name": "John", "days": 22, "base_salary": 5000000},
+        #     {"id": "E002", "name": "Jane", "days": 20, "base_salary": 6000000}
+        # ]
+    """
+    if not attendance_data or not salary_data:
+        return []
+    
+    # Lấy header rows
+    attendance_headers = attendance_data[header_row_index] if len(attendance_data) > header_row_index else []
+    salary_headers = salary_data[header_row_index] if len(salary_data) > header_row_index else []
+    
+    # Convert None headers thành string
+    attendance_headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(attendance_headers)]
+    salary_headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(salary_headers)]
+    
+    # Convert salary data thành dictionary để lookup nhanh
+    salary_dict = {}
+    for row in salary_data[data_start_index:]:  # Bỏ qua header
+        if row and len(row) > 0 and row[0]:  # Có employee ID
+            employee_id = str(row[0]).strip()
+            salary_dict[employee_id] = row
+    
+    # Combine data
+    combined = []
+    for row in attendance_data[data_start_index:]:  # Bỏ qua header
+        if not row or len(row) == 0 or not row[0]:
+            continue
+            
+        employee_id = str(row[0]).strip()
+        
+        # Tạo dictionary cho nhân viên này
+        employee_data = {}
+        
+        # Thêm dữ liệu từ attendance
+        for i, header in enumerate(attendance_headers):
+            if i < len(row):
+                employee_data[f"attendance_{header}"] = row[i]
+        
+        # Thêm dữ liệu từ salary (nếu tìm thấy)
+        if employee_id in salary_dict:
+            salary_row = salary_dict[employee_id]
+            for i, header in enumerate(salary_headers):
+                if i < len(salary_row):
+                    employee_data[f"salary_{header}"] = salary_row[i]
+        
+        combined.append(employee_data)
+    
+    return combined
+
+
+def parse_excel_with_smart_header(file_path, sheet_name=None, skip_rows=0):
+    """
+    Đọc file Excel với khả năng tự động tìm header row
+    
+    Args:
+        file_path (str): Đường dẫn đến file Excel
+        sheet_name (str, optional): Tên sheet cần đọc
+        skip_rows (int): Số dòng bỏ qua từ đầu (mặc định 0)
+    
+    Returns:
+        tuple: (headers, data_rows)
+            - headers: List các tên cột
+            - data_rows: List các dòng dữ liệu (không bao gồm header)
+    """
+    raw_data = read_excel_to_array(file_path, sheet_name)
+    
+    if not raw_data or len(raw_data) <= skip_rows:
+        return [], []
+    
+    # Bỏ qua các dòng đầu
+    data = raw_data[skip_rows:]
+    
+    # Tìm header row (dòng đầu tiên có nhiều giá trị không None)
+    header_row_idx = 0
+    max_non_none = 0
+    
+    for i, row in enumerate(data[:10]):  # Chỉ kiểm tra 10 dòng đầu
+        non_none_count = sum(1 for cell in row if cell is not None and str(cell).strip())
+        if non_none_count > max_non_none:
+            max_non_none = non_none_count
+            header_row_idx = i
+    
+    headers = data[header_row_idx] if len(data) > header_row_idx else []
+    data_rows = data[header_row_idx + 1:] if len(data) > header_row_idx + 1 else []
+    
+    # Convert None headers thành string
+    headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(headers)]
+    
+    return headers, data_rows
+
+
+def convert_to_dict_with_headers(headers, data_rows):
+    """
+    Convert data rows thành list of dictionaries với headers
+    
+    Args:
+        headers (list): Danh sách tên cột
+        data_rows (list): Danh sách các dòng dữ liệu
+    
+    Returns:
+        list: Danh sách dictionary
+    """
+    result = []
+    for row in data_rows:
+        if not row or all(cell is None for cell in row):
+            continue
+        
+        row_dict = {}
+        for i, header in enumerate(headers):
+            if i < len(row):
+                row_dict[header] = row[i]
+            else:
+                row_dict[header] = None
+        
+        result.append(row_dict)
+    
+    return result
+
+
+def get_sheet_names(file_path):
+    """
+    Lấy danh sách tên các sheets trong file Excel
+    
+    Args:
+        file_path (str): Đường dẫn đến file Excel
+    
+    Returns:
+        list: Danh sách tên các sheets
+    """
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    sheet_names = wb.sheetnames
+    wb.close()
+    return sheet_names
 
 
 # Ví dụ sử dụng

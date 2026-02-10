@@ -212,3 +212,10 @@ service-account.json
 
 # Add my own files 
 /tests
+/logs
+/memories
+/postgres_data
+/redis_data
+/saved_prompt
+/uploads
+/outputs

@@ -17,6 +17,12 @@ services:
     env_file:
       - .env
 
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
     volumes:
       # For development hot-reload, mount source code (comment out for production)
       - ./:/app
@@ -88,11 +94,20 @@ services:
     ports:
       - "8901:5432"
 
-    env_file:
-      - .env
+    environment:
+      POSTGRES_USER: ${PORTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${PORTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${PORTGRES_DB:-salary_db}
 
     volumes:
       - ./postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PORTGRES_USER:-postgres} -d ${PORTGRES_DB:-salary_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
     networks:
       - salary-network
